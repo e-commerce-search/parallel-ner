@@ -161,11 +161,7 @@ def model_fn(features, labels, mode, params):
     steps_per_epoch = model_config.num_training_examples / config.batch_size
     num_train_steps = int(steps_per_epoch * config.epochs)
     num_warmup_steps = int(steps_per_epoch * model_config.warmup_proportion)
-    if config.reader == 'FusedDataset': # avoid serialization of SparseTensor.
-        assert config.lookup_embedding_ids, 'Expecting ids instead of tokens!'
-        for k, v in features.items():
-            if isinstance(v, dict):
-                features[k] = tf.SparseTensor(**v)
+
     tmp = [features[feature_stats[k]['feature_id']] for k
             in query_answer_feature_names]
     assert model_config.num_queries == 2
