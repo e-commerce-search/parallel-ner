@@ -11,7 +11,12 @@ from bert import optimization
 from models import metric_utils
 from tf_utils import to_vec, to_col, tf_repeat, unique_2d, \
 bash_uniq_with_counts, sparse_tensor_to_dense, \
-sequence_length_from_sparse_tensor, segment_inner_range, sparse_fill_empty_rows
+sequence_length_from_sparse_tensor, segment_inner_range, \
+sparse_fill_empty_rows, binary_classification_metrics
+
+flags = tf.flags
+
+FLAGS = flags.FLAGS
 
 
 def sparse_sequence_match(haystack, needle):
@@ -146,35 +151,27 @@ def fill_missing(batch_idx, needle_idx, start_pos, text_a, num_labels):
 
 def model_fn(features, labels, mode, params):
     is_training = mode == ModeKeys.TRAIN
-    config, args = params['config'], params['args']
-    model_config = config.model_config
-    query_answer_feature_names = (
-        model_config.query_answer_feature_names.split(','))
-    feature_stats = {k: v for k, v in config.feature_stats.items() if k in
-        query_answer_feature_names}
+    model_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+
     num_labels, learning_rate, use_tpu, use_one_hot_embeddings = (
         model_config.num_labels, model_config.learning_rate,
         model_config.use_tpu, model_config.use_one_hot_embeddings)
     init_checkpoint = (model_config.init_checkpoint and
         model_config.init_checkpoint.split(':')[-1])
 
-    steps_per_epoch = model_config.num_training_examples / config.batch_size
-    num_train_steps = int(steps_per_epoch * config.epochs)
+    steps_per_epoch = model_config.num_training_examples / model_config.batch_size
+    num_train_steps = int(steps_per_epoch * model_config.epochs)
     num_warmup_steps = int(steps_per_epoch * model_config.warmup_proportion)
 
-    tmp = [features[feature_stats[k]['feature_id']] for k
-            in query_answer_feature_names]
     assert model_config.num_queries == 2
     text_a = features['sentence']
     text_b = features['entity']
-    label = features['label']
+    label = features.get('label')
 
     with tf.device('/device:CPU:0'):
-        vocab_file_paths = [v['vocab_file'].split(':')[-1] for v in
-          feature_stats.values()]
         to_dense = functools.partial(custom_bert.bert_sparse_to_dense, text_a,
             seq_length=model_config.seq_length,
-            vocab_file_path=vocab_file_paths[0],
+            vocab_file_path=FLAGS.vocab_file,
             discard_text_b=True)
         input_ids, input_mask, segment_ids = map(tf.to_int32, to_dense(text_a))
         concat_int = tf.concat([input_ids, input_mask, segment_ids], axis=1)
@@ -194,7 +191,7 @@ def model_fn(features, labels, mode, params):
     orig_width = sequence_output.shape[-1].value
     hidden_size = orig_width
     expt_flags = dict(t.split(':') for t in filter(
-        None, config.experimental_flags.split(';')))
+        None, model_config.experimental_flags.split(';')))
     # only use the first column. Later pword columns are treated as features.
     # label > -1 as context feature mask.
     pword_context_aggregator = expt_flags.get('pword_context_aggregator')
@@ -309,7 +306,7 @@ def model_fn(features, labels, mode, params):
     output_spec = None
     if mode == ModeKeys.TRAIN:
         train_op = optimization.create_optimizer(loss, learning_rate,
-            num_train_steps, num_warmup_steps, use_tpu, config=config)
+            num_train_steps, num_warmup_steps, use_tpu)
         output_spec = tf.estimator.EstimatorSpec(
             mode=mode,
             loss=loss,
@@ -320,21 +317,15 @@ def model_fn(features, labels, mode, params):
             def update_metrics(labels, logits, metrics, scope=None):
                 probabilities = to_vec(tf.sigmoid(logits))
                 predicted_classes = tf.to_int32(probabilities > 0.5)
-                tmp = metric_utils.binary_classification_metrics(
+                tmp = binary_classification_metrics(
                 to_vec(labels), {'predicted_classes': predicted_classes,
-                'probabilities': probabilities, 'logits': to_vec(logits)}, config)
+                'probabilities': probabilities, 'logits': to_vec(logits)})
                 for k, v in tmp.items():
                     metrics['%s/%s' % (scope, k) if scope else k] = v
 
             update_metrics(labels, logits, metrics)
             for i in range(num_labels):
                 update_metrics(labels[:, i], logits[:, i], metrics, 'column_%d' % i)
-
-            if args.role == 'evaluator' and args.index > 0:
-                scope = 'secondary_eval'    # to be backward compatible.
-                scope += '_%d' % args.index if args.index > 1 else ''
-                metrics = {'%s/%s' % (scope, k): v for k, v in metrics.items()}
-
             return metrics
 
         eval_metric_ops = metric_fn(per_example_loss, labels, logits)

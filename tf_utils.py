@@ -2,6 +2,9 @@
 import random, string
 
 import tensorflow as tf
+from natsort import natsorted
+import braceexpand
+import glob
 
 
 def batch_size(mode, config):
@@ -321,3 +324,61 @@ def indexed_slices_to_dense(indexed_slices):
         from tensorflow.python.ops import gradients_impl
         return gradients_impl._IndexedSlicesToTensor(indexed_slices)
 
+
+def glob_files(file_pattern):
+    file_patterns = braceexpand.braceexpand(file_pattern)
+    filenames = natsorted([f for fp in file_patterns for f in glob.glob(fp)])
+    return filenames
+
+
+def count_nonzero(t):
+    return tf.to_float(tf.reduce_sum(tf.to_float(t)))
+
+
+def binary_classification_metrics(labels, predictions):
+    neutral_label = 0.5
+    positive_labels = tf.greater(labels, neutral_label)
+    negative_labels = tf.greater(neutral_label, labels)
+    binary_labels = tf.to_int32(positive_labels)
+    probabilities = predictions['probabilities']
+    predicted_classes = predictions['predicted_classes']
+    metrics = {}
+    num_pos_labels = tf.to_float(tf.count_nonzero(positive_labels)) + 1e-6
+    num_neg_labels = tf.to_float(tf.count_nonzero(negative_labels)) + 1e-6
+    metrics['num_positive_labels'] = tf.metrics.mean(num_pos_labels)
+    metrics['num_negative_labels'] = tf.metrics.mean(num_neg_labels)
+    def threshold_metrics(threshold=0.5):
+        ret = {}
+        suffix, classes = '', predicted_classes
+        positive_scores = tf.greater(probabilities, threshold)
+        negative_scores = tf.greater(threshold, probabilities)
+        if threshold != 0.5:
+            suffix = '_%s' % threshold
+            classes = tf.to_int32(positive_scores)
+        false_negatives = tf.to_float(count_nonzero(tf.logical_and(
+            positive_labels, negative_scores)))
+        false_positives = tf.to_float(count_nonzero(tf.logical_and(
+            negative_labels, positive_scores)))
+        true_positives = tf.to_float(count_nonzero(tf.logical_and(
+            positive_labels, positive_scores)))
+        recall = true_positives / (true_positives + false_negatives + 1e-9)
+        precision = true_positives / (true_positives + false_positives + 1e-9)
+        f1_score = 2 * (precision * recall) / (precision + recall + 1e-9)
+        neg_predictions = tf.to_float(count_nonzero(negative_scores))
+        pos_predictions = tf.to_float(count_nonzero(positive_scores))
+        ret['num_positive_scores' + suffix] = tf.metrics.mean(pos_predictions)
+        ret['num_negative_scores' + suffix] = tf.metrics.mean(neg_predictions)
+        ret['accuracy' + suffix] = tf.metrics.accuracy(
+            labels=binary_labels, predictions=classes)
+        ret['precision' + suffix] = tf.metrics.precision(
+            labels=binary_labels, predictions=classes)
+        ret['recall' + suffix] = tf.metrics.recall(
+            labels=binary_labels, predictions=classes)
+        ret['f1_score' + suffix] = tf.metrics.mean(f1_score)
+        return ret
+
+    metrics.update(threshold_metrics())
+    metrics['%s_labels_pct' % neutral_label] = tf.metrics.mean(
+        tf.cast(tf.equal(labels, neutral_label), dtype=tf.float32),
+        name='neutral_pct_op')
+    return metrics

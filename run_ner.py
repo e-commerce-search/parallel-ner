@@ -1,92 +1,99 @@
 import os, sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import tensorflow as tf
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from bert.run_classifier import *
 from bert import tokenization
 import multi_ner
-
-class PwordProcessor(DataProcessor):
-  """Processor for the product word data set."""
-
-  def __init__(self):
-    self.language = "zh"
-
-  def get_train_examples(self, data_dir):
-    """See base class."""
-    lines = self._read_tsv(
-        os.path.join(data_dir, "multinli",
-                     "multinli.train.%s.tsv" % self.language))
-    examples = []
-    for (i, line) in enumerate(lines):
-      if i == 0:
-        continue
-      guid = "train-%d" % (i)
-      text_a = tokenization.convert_to_unicode(line[0])
-      text_b = tokenization.convert_to_unicode(line[1])
-      label = tokenization.convert_to_unicode(line[2])
-      if label == tokenization.convert_to_unicode("contradictory"):
-        label = tokenization.convert_to_unicode("contradiction")
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-    return examples
-
-  def get_dev_examples(self, data_dir):
-    """See base class."""
-    lines = self._read_tsv(os.path.join(data_dir, "xnli.dev.tsv"))
-    examples = []
-    for (i, line) in enumerate(lines):
-      if i == 0:
-        continue
-      guid = "dev-%d" % (i)
-      language = tokenization.convert_to_unicode(line[0])
-      if language != tokenization.convert_to_unicode(self.language):
-        continue
-      text_a = tokenization.convert_to_unicode(line[6])
-      text_b = tokenization.convert_to_unicode(line[7])
-      label = tokenization.convert_to_unicode(line[1])
-      examples.append(
-          InputExample(guid=guid, text_a=text_a, text_b=text_b, label=label))
-    return examples
-
-  def get_labels(self):
-    """See base class."""
-    return ["contradiction", "entailment", "neutral"]
+import tf_utils
+import multiprocessing
 
 
-def file_based_convert_examples_to_features(examples, label_list, tokenizer, output_file):
-    """Convert a set of `InputExample`s to a TFRecord file."""
+class NamedEntityRecognitionProcessor(DataProcessor):
+    """Base Processor for NER data set, with sentence/entity/label."""
+    def __init__(self, tokenizer):
+        self._tokenizer = tokenizer
 
-    writer = tf.python_io.TFRecordWriter(output_file)
+    def name(self):
+        return ''
+        raise NotImplementedError()
 
-    for (ex_index, example) in enumerate(examples):
-        if ex_index % 10000 == 0:
-            tf.logging.info("Writing example %d of %d" %
-                            (ex_index, len(examples)))
+    def get_examples(self, data_dir, split_type='train'):
+        """See base class."""
+        base_dir = os.path.join(data_dir, self.name())
+        num_examples_file = os.path.join(base_dir, 'num_%s_examples.txt' % split_type)
+        if os.path.exists(num_examples_file):   # tokenization and tfrecord already done!
+            with open(num_examples_file) as f:
+                return int(f.readline().strip())
+
+        prefix = os.path.join(base_dir, "{}.{}.tsv".format(self.name(), split_type))
         def create_bytes_feature(values):
-            f = tf.train.Feature(bytes_list=tf.train.BytesList(
-                value=list(values)))
-            return f
-        def create_int_feature(values):
-            return tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
+            return tf.train.Feature(bytes_list=tf.train.BytesList(value=list(values)))
 
-        features = collections.OrderedDict()
-        features['sentence'] = create_bytes_feature(tokenizer.tokenize(example.text_a))
-        features['entity'] = create_bytes_feature(tokenizer.tokenize(example.text_b))
-        features['label'] = create_int_feature([label_list[example.label]])
+        def create_float_feature(values):
+            return tf.train.Feature(float_list=tf.train.FloatList(value=list(values)))
 
-        tf_example = tf.train.Example(features=tf.train.Features(
-            feature=features))
-        writer.write(tf_example.SerializeToString())
-    writer.close()
+        def create_tf_record_file(input_file, output_file):
+            with tf.python_io.TFRecordWriter(output_file) as w, open(input_file) as f:
+                ex_index = 0
+                for ex_index, line in enumerate(f):
+                    if ex_index % 10000 == 0:
+                        tf.logging.info("Writing % example %d of %s" % (
+                            split_type, ex_index, input_file))
+                    tmp = line.strip('\r\n').split('\t')
+                    text_a, text_b, label = tmp[0], tmp[1], tmp[2:]
+                    features = collections.OrderedDict()
+                    features['sentence'] = create_bytes_feature(
+                        self._tokenizer.tokenize(text_a))
+                    features['entity'] = create_bytes_feature(
+                        self._tokenizer.tokenize(text_b))
+                    features['label'] = create_float_feature(
+                        list(map(float, label)))
+                    tf_example = tf.train.Example(features=tf.train.Features(
+                        feature=features))
+                    w.write(tf_example.SerializeToString())
+                return ex_index
+
+        pool, results = multiprocessing.Pool(), []
+        for input_file in tf_utils.glob_files(prefix + '*'):
+            suffix = input_file[len(prefix):]
+            output_file = os.path.join(base_dir, split_type + '.tf_record' + suffix)
+            results.append(pool.apply_async(create_tf_record_file, (
+                input_file, output_file)))
+        num_examples = sum(result.get() for result in results)
+        setattr(self, '_num_%s_examples' % split_type, num_examples)
+        [pool.close(), pool.join()]
+        with open(num_examples_file, 'w') as f:
+            f.write(str(num_examples))
+        return num_examples
+
+    def get_train_examples(self, data_dir):
+        return self.get_examples(data_dir, 'train')
+
+    def get_dev_examples(self, data_dir):
+        return self.get_examples(data_dir, 'dev')
+
+    def get_test_examples(self, data_dir):
+        return self.get_examples(data_dir, 'test')
+
+
+class PwordProcessor(NamedEntityRecognitionProcessor):
+    """Processor for the product word data set."""
+    def name(self):
+        return 'pword'
+
+
+class MsraProcessor(NamedEntityRecognitionProcessor):
+    """Processor for the product word data set."""
+    def name(self):
+        return 'msra'
 
 
 def main(_):
     tf.logging.set_verbosity(tf.logging.INFO)
     processors = {
-        "cola": ColaProcessor,
-        "mnli": MnliProcessor,
-        "mrpc": MrpcProcessor,
-        "xnli": XnliProcessor,
+        "pword": PwordProcessor,
+        "msra": MsraProcessor,
     }
     task_name = FLAGS.task_name.lower()
     processor = processors[task_name]()
@@ -112,14 +119,11 @@ def main(_):
 
     train_examples = None
     num_train_steps = None
-    num_warmup_steps = None
-    label_list = processor.get_labels()
+    num_train_examples = None
     if FLAGS.do_train:
-        train_examples = processor.get_train_examples(FLAGS.data_dir)
+        num_train_examples = processor.get_train_examples(FLAGS.data_dir)
         num_train_steps = int(
-            len(train_examples) / FLAGS.train_batch_size *
-            FLAGS.num_train_epochs)
-        num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
+            num_train_examples / FLAGS.train_batch_size * FLAGS.num_train_epochs)
 
 
     model_fn = multi_ner.model_fn
@@ -135,10 +139,9 @@ def main(_):
 
     if FLAGS.do_train:
         # tfrecord stores text rather than token ids.
-        train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
-        file_based_convert_examples_to_features(train_examples, tokenizer, train_file)
+        train_file = tf_utils.global_fiiles(os.path.join(FLAGS.output_dir, "train.tf_record*"))
         tf.logging.info("***** Running training *****")
-        tf.logging.info("  Num examples = %d", len(train_examples))
+        tf.logging.info("  Num examples = %d", num_train_examples)
         tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
         tf.logging.info("  Num steps = %d", num_train_steps)
         train_input_fn = file_based_input_fn_builder(
@@ -149,35 +152,17 @@ def main(_):
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
     if FLAGS.do_eval:
-        eval_examples = processor.get_dev_examples(FLAGS.data_dir)
-        num_actual_eval_examples = len(eval_examples)
-        if FLAGS.use_tpu:
-            # TPU requires a fixed batch size for all batches, therefore the number
-            # of examples must be a multiple of the batch size, or else examples
-            # will get dropped. So we pad with fake examples which are ignored
-            # later on. These do NOT count towards the metric (all tf.metrics
-            # support a per-instance weight, and these get a weight of 0.0).
-            while len(eval_examples) % FLAGS.eval_batch_size != 0:
-                eval_examples.append(PaddingInputExample())
+        num_eval_examples = processor.get_dev_examples(FLAGS.data_dir)
 
-        eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
-        file_based_convert_examples_to_features(eval_examples, tokenizer, eval_file)
+        eval_file = tf_utils.glob_files(os.path.join(FLAGS.output_dir, "eval.tf_record*"))
 
         tf.logging.info("***** Running evaluation *****")
-        tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                        len(eval_examples), num_actual_eval_examples,
-                        len(eval_examples) - num_actual_eval_examples)
         tf.logging.info("  Batch size = %d", FLAGS.eval_batch_size)
 
         # This tells the estimator to run through the entire set.
         eval_steps = None
-        # However, if running eval on the TPU, you will need to specify the
-        # number of steps.
-        if FLAGS.use_tpu:
-            assert len(eval_examples) % FLAGS.eval_batch_size == 0
-            eval_steps = int(len(eval_examples) // FLAGS.eval_batch_size)
 
-        eval_drop_remainder = True if FLAGS.use_tpu else False
+        eval_drop_remainder =  False
         eval_input_fn = file_based_input_fn_builder(
             input_file=eval_file,
             seq_length=FLAGS.max_seq_length,
@@ -194,23 +179,11 @@ def main(_):
                 writer.write("%s = %s\n" % (key, str(result[key])))
 
     if FLAGS.do_predict:
-        predict_examples = processor.get_test_examples(FLAGS.data_dir)
-        num_actual_predict_examples = len(predict_examples)
-        if FLAGS.use_tpu:
-            # TPU requires a fixed batch size for all batches, therefore the number
-            # of examples must be a multiple of the batch size, or else examples
-            # will get dropped. So we pad with fake examples which are ignored
-            # later on.
-            while len(predict_examples) % FLAGS.predict_batch_size != 0:
-                predict_examples.append(PaddingInputExample())
+        num_predict_examples = processor.get_test_examples(FLAGS.data_dir)
 
-        predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
-        file_based_convert_examples_to_features(predict_examples, tokenizer, predict_file)
+        predict_file = tf_utils.glob_files(os.path.join(FLAGS.output_dir, "predict.tf_record*"))
 
         tf.logging.info("***** Running prediction*****")
-        tf.logging.info("  Num examples = %d (%d actual, %d padding)",
-                        len(predict_examples), num_actual_predict_examples,
-                        len(predict_examples) - num_actual_predict_examples)
         tf.logging.info("  Batch size = %d", FLAGS.predict_batch_size)
 
         predict_drop_remainder = True if FLAGS.use_tpu else False
@@ -229,11 +202,11 @@ def main(_):
             tf.logging.info("***** Predict results *****")
             for (i, prediction) in enumerate(result):
                 probabilities = prediction["probabilities"]
-                if i >= num_actual_predict_examples:
+                if i >= num_predict_examples:
                     break
                 output_line = "\t".join(
                     str(class_probability)
                     for class_probability in probabilities) + "\n"
                 writer.write(output_line)
                 num_written_lines += 1
-        assert num_written_lines == num_actual_predict_examples
+        assert num_written_lines == num_predict_examples
